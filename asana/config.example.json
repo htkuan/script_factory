@@ -1,0 +1,6 @@
+{
+  "workspace_id": "your-workspace-id",
+  "project_id": "your-project-id",
+  "token": "your-asana-personal-access-token",
+  "sprint_custom_field_gid": "your-sprint-custom-field-gid"
+}
