@@ -173,11 +173,18 @@ else
     echo "Invalid SPRINT_GID: ${sprint_gid}" >&2
     exit 1
   fi
-  sprint_name="Sprint ${sprint_gid}"
+  custom_field_url="https://app.asana.com/api/1.0/custom_fields/${sprint_custom_field_gid}"
+  custom_field_response=$(api_call "$custom_field_url")
+  if [[ -n "$custom_field_response" ]]; then
+    sprint_name=$(echo "$custom_field_response" | jq -r --arg gid "$sprint_gid" '.data.enum_options[]? | select(.gid == $gid) | .name // empty')
+  fi
+  if [[ -z "${sprint_name:-}" ]]; then
+    sprint_name="Sprint ${sprint_gid}"
+  fi
 fi
 
 # 建立以 Sprint 名稱命名的輸出目錄（/ 替換為 - 避免路徑問題）
-output_dir=$(echo "$sprint_name" | sed 's|/|-|g')
+output_dir="asana_data/$(echo "$sprint_name" | sed 's|/|-|g')"
 mkdir -p "$output_dir"
 
 # 建立暫存目錄（用於大型 JSON 與並行處理）

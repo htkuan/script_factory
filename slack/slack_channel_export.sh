@@ -5,7 +5,7 @@ set -euo pipefail
 # 取得腳本所在的絕對路徑（無論從哪裡執行都能正確定位）
 SCRIPTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 最終輸出根目錄
-OUTPUT_DIR="$SCRIPTDIR/output"
+OUTPUT_DIR="$SCRIPTDIR/slack_data"
 # map 型快取資料目錄（使用者/群組/頻道對照表）
 CACHE_DIR="$OUTPUT_DIR/cache_data"
 

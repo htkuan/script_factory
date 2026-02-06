@@ -107,7 +107,7 @@ process_author() {
     echo "Processing: $author"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    local output_dir="${START_DATE}_${END_DATE}/${author}"
+    local output_dir="${SCRIPT_DIR}/../github_data/${START_DATE}_${END_DATE}/${author}"
     local output_file="${output_dir}/prs_by_repo.json"
     local temp_file="/tmp/prs_raw_${author}_$$.json"
 
@@ -200,5 +200,5 @@ done
 
 echo ""
 echo "======================================"
-echo "All done! Output directory: ${START_DATE}_${END_DATE}/"
+echo "All done! Output directory: github_data/${START_DATE}_${END_DATE}/"
 echo "======================================"
