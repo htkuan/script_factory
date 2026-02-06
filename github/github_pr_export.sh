@@ -1,64 +1,86 @@
 #!/bin/bash
 
 # ============================================
-# fetch_author_prs.sh
-# Fetch all merged PRs for an author in an org
+# github_pr_export.sh
+# Fetch all merged PRs for authors in an org
+# Reads org & authors from ./config.json
 # ============================================
 
-set -e
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/config.json"
+
+# --- 依賴檢查 ---
+for cmd in gh jq; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "ERROR: '$cmd' is required but not installed." >&2
+        exit 1
+    fi
+done
 
 # --- 參數驗證 ---
-if [ $# -lt 4 ]; then
-    echo "Usage: $0 <org> <author> <start_date> <end_date>"
-    echo "Example: $0 chatbotgang gearoidfan 2026-01-01 2026-01-31"
+if [ $# -lt 2 ]; then
+    echo "Usage: $0 <start_date> <end_date>"
+    echo "Example: $0 2026-01-01 2026-01-31"
     exit 1
 fi
 
-ORG="$1"
-AUTHOR="$2"
-START_DATE="$3"
-END_DATE="$4"
-OUTPUT_FILE="${AUTHOR}_${START_DATE}_${END_DATE}_prs_by_repo.json"
-TEMP_FILE="/tmp/prs_raw_$$.json"
+START_DATE="$1"
+END_DATE="$2"
+
+# --- 日期格式驗證 (YYYY-MM-DD) ---
+validate_date() {
+    local d="$1" label="$2"
+    if ! [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        echo "ERROR: $label '$d' is not in YYYY-MM-DD format." >&2
+        exit 1
+    fi
+    if ! date -j -f "%Y-%m-%d" "$d" "+%Y-%m-%d" &>/dev/null; then
+        echo "ERROR: $label '$d' is not a valid date." >&2
+        exit 1
+    fi
+}
+
+validate_date "$START_DATE" "start_date"
+validate_date "$END_DATE" "end_date"
+
+if [[ "$START_DATE" > "$END_DATE" ]]; then
+    echo "ERROR: start_date ($START_DATE) must be <= end_date ($END_DATE)." >&2
+    exit 1
+fi
+
+# --- config.json 驗證 ---
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "ERROR: config.json not found at $CONFIG_FILE" >&2
+    echo "Please create one based on config.example.json" >&2
+    exit 1
+fi
+
+ORG=$(jq -r '.org // empty' "$CONFIG_FILE")
+if [ -z "$ORG" ]; then
+    echo "ERROR: 'org' is missing or empty in config.json" >&2
+    exit 1
+fi
+
+AUTHORS_COUNT=$(jq '.authors | length' "$CONFIG_FILE")
+if [ "$AUTHORS_COUNT" -eq 0 ]; then
+    echo "ERROR: 'authors' array is empty in config.json" >&2
+    exit 1
+fi
+
+AUTHORS=()
+while IFS= read -r a; do
+    AUTHORS+=("$a")
+done < <(jq -r '.authors[]' "$CONFIG_FILE")
 
 echo "======================================"
 echo "Org:        $ORG"
-echo "Author:     $AUTHOR"
+echo "Authors:    ${AUTHORS[*]}"
 echo "Date Range: $START_DATE to $END_DATE"
-echo "Output:     $OUTPUT_FILE"
 echo "======================================"
 
-# --- Step 1: 取得所有已 merge 的 PR 列表 ---
-echo ""
-echo "[Step 1] Fetching merged PR list..."
-
-PR_LIST=$(gh search prs \
-    --owner "$ORG" \
-    --author "$AUTHOR" \
-    --created "${START_DATE}..${END_DATE}" \
-    --merged \
-    --json repository,number \
-    --jq '.[] | "\(.repository.nameWithOwner) \(.number)"')
-
-if [ -z "$PR_LIST" ]; then
-    PR_COUNT=0
-else
-    PR_COUNT=$(echo "$PR_LIST" | wc -l | tr -d ' ')
-fi
-echo "Found $PR_COUNT merged PRs"
-
-if [ "$PR_COUNT" -eq 0 ]; then
-    echo "No PRs found. Exiting."
-    exit 0
-fi
-
-# --- Step 2: 抓取每個 PR 的詳細內容（並行） ---
-echo ""
-echo "[Step 2] Fetching PR details..."
-
-> "$TEMP_FILE"  # 清空暫存檔
-
-# 帶重試邏輯的 PR 抓取函式
+# --- 帶重試邏輯的 PR 抓取函式 ---
 fetch_pr_with_retry() {
     local pr="$1" repo="$2" max_retries=3 attempt=0
     while [ $attempt -lt $max_retries ]; do
@@ -76,77 +98,107 @@ fetch_pr_with_retry() {
 
 export -f fetch_pr_with_retry
 
-PARALLEL_JOBS=5
-TEMP_DIR="/tmp/prs_parallel_$$"
-mkdir -p "$TEMP_DIR"
+# --- 單一 author 的處理函式 ---
+process_author() {
+    local author="$1"
 
-echo "  Fetching $PR_COUNT PRs with $PARALLEL_JOBS parallel workers..."
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Processing: $author"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-echo "$PR_LIST" | xargs -P "$PARALLEL_JOBS" -L 1 bash -c '
-    repo="$1"; pr="$2"
-    fetch_pr_with_retry "$pr" "$repo" > "'"$TEMP_DIR"'/${pr}_${repo//\//_}.json"
-' _
+    local output_dir="${START_DATE}_${END_DATE}/${author}"
+    local output_file="${output_dir}/prs_by_repo.json"
+    local temp_file="/tmp/prs_raw_${author}_$$.json"
 
-# 合併所有並行結果
-cat "$TEMP_DIR"/*.json > "$TEMP_FILE" 2>/dev/null || true
-rm -rf "$TEMP_DIR"
+    mkdir -p "$output_dir"
 
-echo "  Completed fetching $PR_COUNT PRs."
+    # Step 1: 取得所有已 merge 的 PR 列表
+    echo "[Step 1] Fetching merged PR list for $author..."
 
-# --- Step 3: 合併成 JSON 陣列 ---
-echo ""
-echo "[Step 3] Combining into JSON array..."
+    local pr_list
+    pr_list=$(gh search prs \
+        --owner "$ORG" \
+        --author "$author" \
+        --created "${START_DATE}..${END_DATE}" \
+        --merged \
+        --json repository,number \
+        --jq '.[] | "\(.repository.nameWithOwner) \(.number)"')
 
-jq -s '.' "$TEMP_FILE" > "/tmp/prs_array_$$.json"
+    local pr_count
+    if [ -z "$pr_list" ]; then
+        pr_count=0
+    else
+        pr_count=$(echo "$pr_list" | wc -l | tr -d ' ')
+    fi
+    echo "  Found $pr_count merged PRs"
 
-# --- Step 4: 以 repo 分類並按 mergedAt 排序 ---
-echo ""
-echo "[Step 4] Grouping by repo and sorting by merge time..."
+    if [ "$pr_count" -eq 0 ]; then
+        echo "  No PRs found for $author. Skipping."
+        return 0
+    fi
 
-jq '
-  group_by(.url | split("/")[4]) |
-  map({
-    (.[0].url | split("/")[4]): (sort_by(.mergedAt) | reverse)
-  }) |
-  add
-' "/tmp/prs_array_$$.json" > "$OUTPUT_FILE"
+    # Step 2: 抓取每個 PR 的詳細內容（並行）
+    echo "[Step 2] Fetching PR details ($pr_count PRs, 5 parallel workers)..."
 
-# --- 清理暫存檔 ---
-rm -f "$TEMP_FILE" "/tmp/prs_array_$$.json"
+    > "$temp_file"
+    local parallel_jobs=5
+    local temp_dir="/tmp/prs_parallel_${author}_$$"
+    mkdir -p "$temp_dir"
 
-# --- 完成 ---
-echo ""
-echo "======================================"
-echo "Done! Output saved to: $OUTPUT_FILE"
-echo ""
-echo "Stats:"
-jq 'to_entries | map({repo: .key, count: (.value | length)})' "$OUTPUT_FILE"
-echo "======================================"
+    echo "$pr_list" | xargs -P "$parallel_jobs" -L 1 bash -c '
+        repo="$1"; pr="$2"
+        fetch_pr_with_retry "$pr" "$repo" > "'"$temp_dir"'/${pr}_${repo//\//_}.json"
+    ' _
 
-# --- Step 5: 轉換成 Markdown 檔案 ---
-echo ""
-echo "[Step 5] Converting to Markdown files..."
+    cat "$temp_dir"/*.json > "$temp_file" 2>/dev/null || true
+    rm -rf "$temp_dir"
 
-GENERATED_FILES=()
+    # Step 3: 合併成 JSON 陣列
+    echo "[Step 3] Combining into JSON array..."
+    jq -s '.' "$temp_file" > "/tmp/prs_array_${author}_$$.json"
 
-while IFS= read -r repo; do
-    md_file="${AUTHOR}_${START_DATE}_${END_DATE}_${repo}.md"
-    jq -r --arg repo "$repo" '
-      def pr_md:
-        "## [#" + (.number|tostring) + "](" + .url + ") " + (.title // "") + "\n\n" +
-        "- Merged At: " + (.mergedAt // "N/A") + "\n" +
-        "- Created At: " + (.createdAt // "N/A") + "\n" +
-        "- Commits: " + ((.commits // []) | length | tostring) + "\n" +
-        "- Reviews: " + ((.reviews // []) | length | tostring) + "\n" +
-        "- Comments: " + ((.comments // []) | length | tostring) + "\n\n" +
-        "Description:\n" + (.body // "") + "\n";
-      "# " + $repo + "\n\n" + (.[ $repo ] | map(pr_md) | join("\n---\n\n"))
-    ' "$OUTPUT_FILE" > "$md_file"
-    GENERATED_FILES+=("$md_file")
-done < <(jq -r 'keys[]' "$OUTPUT_FILE")
+    # Step 4: 以 repo 分類並按 mergedAt 排序
+    echo "[Step 4] Grouping by repo and sorting by merge time..."
+    jq '
+      group_by(.url | split("/")[4]) |
+      map({
+        (.[0].url | split("/")[4]): (sort_by(.mergedAt) | reverse)
+      }) |
+      add
+    ' "/tmp/prs_array_${author}_$$.json" > "$output_file"
 
-echo ""
-echo "Generated Markdown files:"
-for md_file in "${GENERATED_FILES[@]}"; do
-    echo "  - $md_file"
+    rm -f "$temp_file" "/tmp/prs_array_${author}_$$.json"
+
+    echo "  Stats:"
+    jq 'to_entries | map("    \(.key): \(.value | length) PRs") | .[]' -r "$output_file"
+
+    # Step 5: 轉換成 Markdown 檔案
+    echo "[Step 5] Converting to Markdown files..."
+
+    while IFS= read -r repo; do
+        local md_file="${output_dir}/${repo}.md"
+        jq -r --arg repo "$repo" '
+          def pr_md:
+            "## [#" + (.number|tostring) + "](" + .url + ") " + (.title // "") + "\n\n" +
+            "- Merged At: " + (.mergedAt // "N/A") + "\n" +
+            "- Created At: " + (.createdAt // "N/A") + "\n" +
+            "- Commits: " + ((.commits // []) | length | tostring) + "\n" +
+            "- Reviews: " + ((.reviews // []) | length | tostring) + "\n" +
+            "- Comments: " + ((.comments // []) | length | tostring) + "\n\n" +
+            "Description:\n" + (.body // "") + "\n";
+          "# " + $repo + "\n\n" + (.[ $repo ] | map(pr_md) | join("\n---\n\n"))
+        ' "$output_file" > "$md_file"
+        echo "  - $md_file"
+    done < <(jq -r 'keys[]' "$output_file")
+}
+
+# --- 主流程：遍歷所有 authors ---
+for author in "${AUTHORS[@]}"; do
+    process_author "$author"
 done
+
+echo ""
+echo "======================================"
+echo "All done! Output directory: ${START_DATE}_${END_DATE}/"
+echo "======================================"

@@ -88,7 +88,6 @@ fi
 asana_json="$1"
 sprint_gid="${2:-}"
 
-output_file="assignee.json"
 generate_markdown=true
 with_comments=true
 
@@ -176,6 +175,10 @@ else
   fi
   sprint_name="Sprint ${sprint_gid}"
 fi
+
+# 建立以 Sprint 名稱命名的輸出目錄（/ 替換為 - 避免路徑問題）
+output_dir=$(echo "$sprint_name" | sed 's|/|-|g')
+mkdir -p "$output_dir"
 
 # 建立暫存目錄（用於大型 JSON 與並行處理）
 tmp_dir=$(mktemp -d)
@@ -397,10 +400,15 @@ final_json=$(echo "$tasks_with_subtasks" | jq --arg sprint_name "$sprint_name" -
   }
 ')
 
-# 寫入 JSON 檔案
-echo "$final_json" > "$output_file"
+# 依負責人寫入個別 JSON 檔案
+assignee_count=$(echo "$final_json" | jq '.assignees | length')
+for (( i=0; i<assignee_count; i++ )); do
+  a_name=$(echo "$final_json" | jq -r ".assignees[$i].assignee.name")
+  safe_name=$(echo "$a_name" | sed 's|/|-|g; s|[:\\]|_|g')
+  echo "$final_json" | jq ".metadata as \$meta | .assignees[$i] | {metadata: \$meta} + ." > "${output_dir}/${safe_name}.json"
+done
 
-echo "Exported to: ${output_file}" >&2
+echo "Exported to: ${output_dir}/" >&2
 
 # 以 jq 生成摘要文字（供 stderr 顯示）
 # 轉換邏輯：從 metadata 取總數，並逐位列出每位負責人的任務統計
@@ -417,63 +425,28 @@ echo "$final_json" | jq -r '
   (.assignees[] | "  - \(.assignee.name): \(.task_count) tasks (\(.completed_count) done, \(.open_count) open)")
 ' >&2
 
-# 產生 Markdown 報告（預設啟用）
-# 轉換重點：
-# - 先輸出報表標題與 Summary 表格
-# - 計算完成百分比（completed / total）
-# - 產生 Assignee 概覽表
-# - 逐一列出每位負責人（先未完成，再已完成），並補上連結、描述、欄位、子任務、留言
+# 產生 per-assignee Markdown 報告（預設啟用）
 if [[ "$generate_markdown" == "true" ]]; then
-  md_file="${output_file%.json}.md"
   echo "" >&2
-  echo "Generating Markdown report..." >&2
+  echo "Generating Markdown reports..." >&2
 
-  jq -r '
-    # Header
-    "# Sprint Report: \(.metadata.sprint.name)\n",
-    "> Exported: \(.metadata.exported_at)\n",
+  for (( i=0; i<assignee_count; i++ )); do
+    a_name=$(echo "$final_json" | jq -r ".assignees[$i].assignee.name")
+    safe_name=$(echo "$a_name" | sed 's|/|-|g; s|[:\\]|_|g')
 
-    # Summary section
-    "## 📊 Summary\n",
-    "| Metric | Count |",
-    "|--------|-------|",
-    "| Total Tasks | \(.metadata.total_tasks) |",
-    "| ✅ Completed | \(.metadata.total_completed) |",
-    "| 🔄 Open | \(.metadata.total_open) |",
-    "| 👥 Assignees | \(.metadata.assignee_count) |",
-    "",
+    jq -r '
+      "# Sprint Report: \(.metadata.sprint.name)\n",
+      "> Exported: \(.metadata.exported_at)\n",
 
-    # Progress bar
-    "### Progress",
-    "",
-    (
-      (if .metadata.total_tasks == 0 then 0 else (.metadata.total_completed / .metadata.total_tasks * 100) end) as $pct |
-      "**\($pct | floor)%** completed (\(.metadata.total_completed)/\(.metadata.total_tasks) tasks)"
-    ),
-    "",
-
-    # Assignee overview table
-    "## 👥 Assignee Overview\n",
-    "| Assignee | Total | ✅ Done | 🔄 Open |",
-    "|----------|-------|---------|---------|",
-    (.assignees[] | "| \(.assignee.name) | \(.task_count) | \(.completed_count) | \(.open_count) |"),
-    "",
-
-    # Detailed tasks by assignee
-    "---\n",
-    "## 📋 Tasks by Assignee\n",
-
-    # Loop through each assignee
-    (.assignees[] |
-      "### \(.assignee.name)",
+      "## \(.assignee.name)",
       (if .assignee.email then "_\(.assignee.email)_" else "" end),
       "",
       "**Tasks: \(.task_count)** | ✅ \(.completed_count) done | 🔄 \(.open_count) open",
       "",
 
-      # Open tasks first
+      # Open tasks
       (if .open_count > 0 then
-        "#### 🔄 Open Tasks (\(.open_count))\n",
+        "### 🔄 Open Tasks (\(.open_count))\n",
         (.tasks[] | select(.completed == false) |
           "- [ ] **\(.name)**",
           (if .permalink_url then "  - 🔗 [\(.permalink_url)](\(.permalink_url))" else empty end),
@@ -497,28 +470,30 @@ if [[ "$generate_markdown" == "true" ]]; then
 
       # Completed tasks
       (if .completed_count > 0 then
-        "#### ✅ Completed Tasks (\(.completed_count))\n",
+        "### ✅ Completed Tasks (\(.completed_count))\n",
         (.tasks[] | select(.completed == true) |
           "- [x] ~~\(.name)~~",
-          (if .permalink_url then "  - 🔗 [Link](\(.permalink_url))" else empty end),
-          (if .notes and .notes != "" then "  - 📝 \(.notes | gsub("\n"; " ") | if length > 100 then .[0:100] + "..." else . end)" else empty end),
+          (if .permalink_url then "  - 🔗 [\(.permalink_url)](\(.permalink_url))" else empty end),
+          (if .due_on then "  - 📅 Due: \(.due_on)" else empty end),
+          (if .notes and .notes != "" then "  - 📝 Description:", "    > \(.notes | gsub("\n"; "\n    > ") | if length > 500 then .[0:500] + "..." else . end)" else empty end),
           (if (.custom_fields | length) > 0 then
-            "  - 🏷️ " + ([.custom_fields[] | "\(.name): \(.value)"] | join(" | "))
+            "  - 🏷️ Custom Fields:",
+            (.custom_fields[] | "    - **\(.name)**: \(.value)")
           else empty end),
           (if (.subtasks | length) > 0 then
-            "  - 📎 Subtasks (\(.subtasks | length)): " + ([.subtasks[] | (if .completed then "✅" else "⬜" end)] | join(""))
+            "  - 📎 Subtasks (\(.subtasks | length)):",
+            (.subtasks[] | "    - [\(if .completed then "x" else " " end)] \(.name)\(if .assignee and .assignee != "Unassigned" then " (@\(.assignee))" else "" end)")
           else empty end),
           (if (.comments | length) > 0 then
-            "  - 💬 \(.comments | length) comments"
-          else empty end)
+            "  - 💬 Comments (\(.comments | length)):",
+            (.comments[] | "    - **\(.author)** (\(.created_at | split("T")[0])):", "      > \(.text | gsub("\n"; "\n      > "))")
+          else empty end),
+          ""
         ),
         ""
-      else empty end),
+      else empty end)
+    ' "${output_dir}/${safe_name}.json" > "${output_dir}/${safe_name}.md"
+  done
 
-      "---",
-      ""
-    )
-  ' "$output_file" > "$md_file"
-
-  echo "Markdown exported to: ${md_file}" >&2
+  echo "Markdown exported to: ${output_dir}/" >&2
 fi

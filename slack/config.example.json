@@ -1,6 +1,4 @@
 {
-  "start_date": "2026-01-01",
-  "end_date": "2026-01-31",
   "slack_token": "xoxb-your-slack-bot-token",
   "channels": [
     "#channel-name-1",

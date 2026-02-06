@@ -4,10 +4,10 @@ set -euo pipefail
 
 # 取得腳本所在的絕對路徑（無論從哪裡執行都能正確定位）
 SCRIPTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# 最終 Markdown 輸出目錄
+# 最終輸出根目錄
 OUTPUT_DIR="$SCRIPTDIR/output"
-# 中間 JSON 資料的儲存目錄
-DATA_DIR="$OUTPUT_DIR/data"
+# map 型快取資料目錄（使用者/群組/頻道對照表）
+CACHE_DIR="$OUTPUT_DIR/cache_data"
 
 # ── Helper functions ──
 
@@ -32,23 +32,30 @@ escape_sed_repl() {
   printf '%s' "$1" | sed -e 's/[&/\\]/\\&/g'
 }
 
-# 驗證設定檔中的必要欄位：slack_token、start_date、end_date、channels。在任何 Stage 執行前先行檢查，避免中途失敗
-validate_config() {
-  local action="$1"
-
-  # slack_token 僅在需要呼叫 API 時驗證（fetch / all）
-  if [[ "$action" == "fetch" || "$action" == "all" ]]; then
-    SLACK_TOKEN=$(jq -r '.slack_token // empty' "$CONFIG_FILE")
-    if [[ -z "$SLACK_TOKEN" ]]; then
-      echo "Error: slack_token missing in $CONFIG_FILE" >&2
-      exit 1
-    fi
+# 驗證日期格式為 YYYY-MM-DD 且為合法日期（使用 macOS date -j 解析）
+validate_date() {
+  local label="$1" value="$2"
+  if ! [[ "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    echo "Error: $label '$value' is not in YYYY-MM-DD format." >&2
+    exit 1
   fi
+  # round-trip 驗證：macOS date -j 會把 02-30 自動溢位成 03-02，透過轉回字串比對確認日期合法
+  local parsed
+  parsed=$(date -j -f "%Y-%m-%d" "$value" "+%Y-%m-%d" 2>/dev/null) || {
+    echo "Error: $label '$value' is not a valid date." >&2
+    exit 1
+  }
+  if [[ "$parsed" != "$value" ]]; then
+    echo "Error: $label '$value' is not a valid date (overflow to $parsed)." >&2
+    exit 1
+  fi
+}
 
-  START_DATE=$(jq -r '.start_date // empty' "$CONFIG_FILE")
-  END_DATE=$(jq -r '.end_date // empty' "$CONFIG_FILE")
-  if [[ -z "$START_DATE" || -z "$END_DATE" ]]; then
-    echo "Error: start_date or end_date missing in $CONFIG_FILE" >&2
+# 驗證設定檔中的必要欄位：slack_token、channels
+validate_config() {
+  SLACK_TOKEN=$(jq -r '.slack_token // empty' "$CONFIG_FILE")
+  if [[ -z "$SLACK_TOKEN" ]]; then
+    echo "Error: slack_token missing in $CONFIG_FILE" >&2
     exit 1
   fi
 
@@ -124,8 +131,8 @@ stage1_fetch() {
     exit 1
   fi
 
-  # 建立持久輸出目錄
-  mkdir -p "$DATA_DIR"
+  # 建立快取目錄
+  mkdir -p "$CACHE_DIR"
 
   # Temp dir for intermediate pagination merges
   # 建立暫存目錄，並設定 trap 在腳本結束時自動清理
@@ -157,8 +164,8 @@ stage1_fetch() {
     elif ($u.real_name // "") != "" then $u.real_name
     elif ($u.name // "") != "" then $u.name
     else "unknown" end
-  ))' "$users_file" > "$DATA_DIR/user_map.json"
-  echo "  Saved $(jq 'length' "$DATA_DIR/user_map.json") users → data/user_map.json"
+  ))' "$users_file" > "$CACHE_DIR/user_map.json"
+  echo "  Saved $(jq 'length' "$CACHE_DIR/user_map.json") users → cache_data/user_map.json"
 
   # 建立群組對照表：呼叫 usergroups.list API，建立 { SXXXXX: group_handle } 格式。用於後續將 subteam 標記替換成 @group_handle
   # ── Usergroup map ──
@@ -179,8 +186,8 @@ stage1_fetch() {
     sleep 1
   done
 
-  jq 'reduce .[] as $g ({}; .[$g.id] = ($g.handle // $g.name // "unknown"))' "$usergroups_file" > "$DATA_DIR/usergroup_map.json"
-  echo "  Saved $(jq 'length' "$DATA_DIR/usergroup_map.json") usergroups → data/usergroup_map.json"
+  jq 'reduce .[] as $g ({}; .[$g.id] = ($g.handle // $g.name // "unknown"))' "$usergroups_file" > "$CACHE_DIR/usergroup_map.json"
+  echo "  Saved $(jq 'length' "$CACHE_DIR/usergroup_map.json") usergroups → cache_data/usergroup_map.json"
 
   # 建立頻道對照表：呼叫 conversations.list API（公開與私有頻道）。產出兩個檔案：channel_name_to_id.json（名稱→ID）和 channel_id_to_name.json（ID→名稱）
   # ── Channel map ──
@@ -201,9 +208,9 @@ stage1_fetch() {
     sleep 1
   done
 
-  jq 'reduce .[] as $c ({}; .[$c.name] = $c.id)' "$channels_file" > "$DATA_DIR/channel_name_to_id.json"
-  jq 'reduce .[] as $c ({}; .[$c.id] = $c.name)' "$channels_file" > "$DATA_DIR/channel_id_to_name.json"
-  echo "  Saved $(jq 'length' "$DATA_DIR/channel_name_to_id.json") channels → data/channel_*.json"
+  jq 'reduce .[] as $c ({}; .[$c.name] = $c.id)' "$channels_file" > "$CACHE_DIR/channel_name_to_id.json"
+  jq 'reduce .[] as $c ({}; .[$c.id] = $c.name)' "$channels_file" > "$CACHE_DIR/channel_id_to_name.json"
+  echo "  Saved $(jq 'length' "$CACHE_DIR/channel_name_to_id.json") channels → cache_data/channel_*.json"
 
   # 逐一抓取設定檔中指定的頻道訊息
   # ── Fetch messages per channel ──
@@ -216,7 +223,7 @@ stage1_fetch() {
     # 去掉頻道名稱可能的 # 前綴，從對照表查找對應的 channel ID
     local name="${raw_name#\#}"
     local channel_id
-    channel_id=$(jq -r --arg name "$name" '.[$name] // empty' "$DATA_DIR/channel_name_to_id.json")
+    channel_id=$(jq -r --arg name "$name" '.[$name] // empty' "$CACHE_DIR/channel_name_to_id.json")
     if [[ -z "$channel_id" ]]; then
       echo "Warning: could not resolve channel '$raw_name', skipping." >&2
       continue
@@ -273,13 +280,15 @@ stage1_fetch() {
 
     # 按 timestamp 排序、用 unique_by(.ts) 去除重複訊息，存為最終 JSON 檔
     # Sort, deduplicate, save final JSON
-    jq 'unique_by(.ts) | sort_by([(.thread_ts // .ts | tonumber), (.ts | tonumber)])' "$messages_file" > "$DATA_DIR/${name}_${START_DATE}_${END_DATE}.json"
+    local channel_out_dir="$OUTPUT_DIR/${name}/${START_DATE}_${END_DATE}"
+    mkdir -p "$channel_out_dir"
+    jq 'unique_by(.ts) | sort_by([(.thread_ts // .ts | tonumber), (.ts | tonumber)])' "$messages_file" > "$channel_out_dir/${name}_${START_DATE}_${END_DATE}.json"
     local msg_count
-    msg_count=$(jq 'length' "$DATA_DIR/${name}_${START_DATE}_${END_DATE}.json")
-    echo "  Saved $msg_count messages → data/${name}_${START_DATE}_${END_DATE}.json"
+    msg_count=$(jq 'length' "$channel_out_dir/${name}_${START_DATE}_${END_DATE}.json")
+    echo "  Saved $msg_count messages → ${name}/${START_DATE}_${END_DATE}/${name}_${START_DATE}_${END_DATE}.json"
   done
 
-  echo "=== Stage 1 complete. JSON data saved in $DATA_DIR ==="
+  echo "=== Stage 1 complete. JSON data saved in $OUTPUT_DIR ==="
 }
 
 # ── Stage 2：將 JSON 資料轉換為人類可讀的 Markdown 格式。先用 jq 產生原始 Markdown，再用 sed 將 Slack ID 標記替換為真實名稱 ──
@@ -291,9 +300,9 @@ stage2_convert() {
   local start_date="$START_DATE"
   local end_date="$END_DATE"
 
-  require_file "$DATA_DIR/user_map.json"
-  require_file "$DATA_DIR/usergroup_map.json"
-  require_file "$DATA_DIR/channel_id_to_name.json"
+  require_file "$CACHE_DIR/user_map.json"
+  require_file "$CACHE_DIR/usergroup_map.json"
+  require_file "$CACHE_DIR/channel_id_to_name.json"
 
   local tmpdir
   tmpdir=$(mktemp -d)
@@ -306,7 +315,8 @@ stage2_convert() {
 
   for raw_name in "${channel_names[@]}"; do
     local name="${raw_name#\#}"
-    local json_file="$DATA_DIR/${name}_${start_date}_${end_date}.json"
+    local channel_out_dir="$OUTPUT_DIR/${name}/${start_date}_${end_date}"
+    local json_file="$channel_out_dir/${name}_${start_date}_${end_date}.json"
 
     if [[ ! -f "$json_file" ]]; then
       echo "Warning: no JSON data for #$name ($json_file), skipping." >&2
@@ -378,7 +388,7 @@ stage2_convert() {
       local safe_name
       safe_name=$(escape_sed_repl "$name_value")
       echo "s/<@${id}(\\|[^>]+)?>/**@${safe_name}**/g" >> "$sed_script"
-    done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$DATA_DIR/user_map.json")
+    done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$CACHE_DIR/user_map.json")
 
     # 發送者 ID: **U12345** → **真實名稱**
     # Sender field: **UXXXX** → **real_name**
@@ -387,7 +397,7 @@ stage2_convert() {
       local safe_name
       safe_name=$(escape_sed_repl "$name_value")
       echo "s/\\*\\*${id}\\*\\*/**${safe_name}**/g" >> "$sed_script"
-    done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$DATA_DIR/user_map.json")
+    done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$CACHE_DIR/user_map.json")
 
     # 群組 mention: <!subteam^S12345> → **@group_handle**
     # Usergroup mention: <!subteam^SXXXX> → **@group_name**
@@ -396,7 +406,7 @@ stage2_convert() {
       local safe_handle
       safe_handle=$(escape_sed_repl "$handle")
       echo "s/<!subteam\\^${id}(\\|[^>]+)?>/\*\*@${safe_handle}\*\*/g" >> "$sed_script"
-    done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$DATA_DIR/usergroup_map.json")
+    done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$CACHE_DIR/usergroup_map.json")
 
     # 頻道 mention（帶名稱）: <#C12345|general> → #general
     # Channel mention: <#CXXXX|name> → #name
@@ -409,7 +419,7 @@ stage2_convert() {
       local safe_channel
       safe_channel=$(escape_sed_repl "$channel_name")
       echo "s/<#${id}>/#${safe_channel}/g" >> "$sed_script"
-    done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$DATA_DIR/channel_id_to_name.json")
+    done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$CACHE_DIR/channel_id_to_name.json")
 
     # 超連結: <url|text> → [text](url)
     # Hyperlinks: <url|text> → [text](url)
@@ -423,10 +433,16 @@ stage2_convert() {
     # Slack bold *text* → **text** (only single *, not already **)
     echo 's/([^*]|^)\*([^*]+)\*/\1**\2**/g' >> "$sed_script"
 
+    # HTML entity 解碼：Slack API 回傳的文字會將 &、<、> 編碼為 HTML entity，需還原。&amp; 必須最後替換，避免二次解碼
+    # HTML entity decode: &lt; → <, &gt; → >, &amp; → & (amp last to avoid double-decoding)
+    echo 's/&lt;/</g' >> "$sed_script"
+    echo 's/&gt;/>/g' >> "$sed_script"
+    echo 's/&amp;/\&/g' >> "$sed_script"
+
     # 組裝最終 Markdown：在內容前加上中文標題和時間區間，然後通過 sed -E -f 套用所有替換規則，輸出最終 .md 檔
     # ── Assemble and apply sed ──
     local output_tmp="$tmpdir/${name}.md.tmp"
-    local output_file="$OUTPUT_DIR/${name}_${start_date}_${end_date}.md"
+    local output_file="$channel_out_dir/${name}_${start_date}_${end_date}.md"
 
     {
       echo "# #${name} 對話紀錄"
@@ -437,7 +453,7 @@ stage2_convert() {
 
     sed -E -f "$sed_script" "$output_tmp" > "$output_file"
 
-    echo "  Saved → ${name}_${start_date}_${end_date}.md"
+    echo "  Saved → ${name}/${start_date}_${end_date}/${name}_${start_date}_${end_date}.md"
   done
 
   echo "=== Stage 2 complete. Markdown saved in $OUTPUT_DIR ==="
@@ -450,41 +466,30 @@ require_cmd jq
 require_cmd sed
 require_cmd date
 
-# 解析命令列參數：第一個參數為設定檔路徑（必填），第二個參數為執行階段（選填，預設 all）
+# 解析命令列參數：start_date（必填）、end_date（必填）
+# 設定檔固定讀取腳本同目錄下的 config.json
 # 注意：此腳本使用 macOS 專用的 date -j 語法，需要 Slack Bot Token（xoxb- 開頭），且 bot 必須已被邀請進目標頻道
-if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <config_file> [fetch|convert|all]" >&2
-  echo "  config_file — path to JSON config (e.g. slack.json)" >&2
-  echo "  fetch       — Stage 1: fetch Slack data → JSON" >&2
-  echo "  convert     — Stage 2: convert JSON → Markdown" >&2
-  echo "  all         — Run both stages (default)" >&2
+if [[ $# -lt 2 ]]; then
+  echo "Usage: $0 <start_date> <end_date>" >&2
+  echo "  start_date — 起始日期 (YYYY-MM-DD)" >&2
+  echo "  end_date   — 結束日期 (YYYY-MM-DD)" >&2
+  echo "  config     — 自動讀取 ./config.json (slack_token, channels)" >&2
   exit 1
 fi
 
-CONFIG_FILE="$1"
+START_DATE="$1"
+END_DATE="$2"
+
+validate_date "start_date" "$START_DATE"
+validate_date "end_date" "$END_DATE"
+
+CONFIG_FILE="$SCRIPTDIR/config.json"
 require_file "$CONFIG_FILE"
 
-ACTION="${2:-all}"
+validate_config
 
-validate_config "$ACTION"
-
-case "$ACTION" in
-  fetch)
-    stage1_fetch
-    ;;
-  convert)
-    stage2_convert
-    ;;
-  all)
-    stage1_fetch
-    stage2_convert
-    ;;
-  *)
-    echo "Error: unknown action '$ACTION'" >&2
-    echo "Usage: $0 <config_file> [fetch|convert|all]" >&2
-    exit 1
-    ;;
-esac
+stage1_fetch
+stage2_convert
 
 echo ""
 echo "Done."
