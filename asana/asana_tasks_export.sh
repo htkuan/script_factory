@@ -85,11 +85,13 @@ if [[ $# -lt 1 || $# -gt 2 ]]; then
   usage
 fi
 
-asana_json="$1"
+# 解析命令列參數
+readonly asana_json="$1"
 sprint_gid="${2:-}"
 
-generate_markdown=true
-with_comments=true
+# 功能開關：是否產生 Markdown 報告、是否抓取留言
+readonly generate_markdown=true
+readonly with_comments=true
 
 if [[ ! -f "$asana_json" ]]; then
   echo "Missing $asana_json" >&2
@@ -97,11 +99,12 @@ if [[ ! -f "$asana_json" ]]; then
 fi
 
 # 從 asana.json 讀取必要的 Asana 設定
-workspace_id=$(jq -r '.workspace_id // empty' "$asana_json")
-project_id=$(jq -r '.project_id // empty' "$asana_json")
-token=$(jq -r '.token // empty' "$asana_json")
-sprint_custom_field_gid=$(jq -r '.sprint_custom_field_gid // empty' "$asana_json")
+readonly workspace_id=$(jq -r '.workspace_id // empty' "$asana_json")
+readonly project_id=$(jq -r '.project_id // empty' "$asana_json")
+readonly token=$(jq -r '.token // empty' "$asana_json")
+readonly sprint_custom_field_gid=$(jq -r '.sprint_custom_field_gid // empty' "$asana_json")
 
+# 檢查必要欄位是否齊全，缺少任一則報錯退出
 missing_fields=()
 if [[ -z "$workspace_id" ]]; then
   missing_fields+=("workspace_id")
@@ -121,6 +124,7 @@ if [[ "${#missing_fields[@]}" -gt 0 ]]; then
   exit 1
 fi
 
+# 匯出 token 到環境變數，因為 xargs -P 產生的子 shell 需要存取 token
 export token
 
 # 若未提供 Sprint GID，則互動式列出可選 Sprint
@@ -184,7 +188,7 @@ else
 fi
 
 # 建立以 Sprint 名稱命名的輸出目錄（/ 替換為 - 避免路徑問題）
-output_dir="asana_data/$(echo "$sprint_name" | sed 's|/|-|g')"
+readonly output_dir="asana_data/$(echo "$sprint_name" | sed 's|/|-|g')"
 mkdir -p "$output_dir"
 
 # 建立暫存目錄（用於大型 JSON 與並行處理）
@@ -194,8 +198,8 @@ trap 'rm -rf "$tmp_dir"' EXIT
 # 建立 Asana API 查詢 URL 與欄位清單
 # API：GET /workspaces/{workspace_gid}/tasks/search
 # opt_fields 指定要回傳的欄位，避免多次查詢
-base_url="https://app.asana.com/api/1.0/workspaces/${workspace_id}/tasks/search"
-opt_fields="gid,name,completed,notes,due_on,start_on,created_at,modified_at,assignee.gid,assignee.name,assignee.email,custom_fields.name,custom_fields.display_value,custom_fields.enum_value.name,tags.name,permalink_url"
+readonly base_url="https://app.asana.com/api/1.0/workspaces/${workspace_id}/tasks/search"
+readonly opt_fields="gid,name,completed,notes,due_on,start_on,created_at,modified_at,assignee.gid,assignee.name,assignee.email,custom_fields.name,custom_fields.display_value,custom_fields.enum_value.name,tags.name,permalink_url"
 
 echo "Fetching tasks for sprint: ${sprint_name}..." >&2
 
@@ -323,6 +327,7 @@ fetch_task_details() {
   echo "$task_with_subtasks" > "$task_file"
 }
 
+# 匯出函數供 xargs -P 產生的子 shell 使用（Bash-only 特性）
 export -f api_call
 export -f fetch_subtasks
 export -f fetch_comments
@@ -330,6 +335,7 @@ export -f fetch_task_details
 
 tasks_with_subtasks="[]"
 
+# 以 10 個並行 worker 抓取每個任務的子任務與留言
 if [[ "$total_tasks" -gt 0 ]]; then
   task_gids=$(jq -r '.[].gid' "$all_tasks_file")
   echo "$task_gids" | xargs -P 10 -I {} bash -c 'fetch_task_details "$@"' _ {} "$tmp_dir" "$with_comments"

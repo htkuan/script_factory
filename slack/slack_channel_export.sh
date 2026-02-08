@@ -1,13 +1,17 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # 嚴格模式 — -e: 指令失敗立即終止; -u: 使用未定義變數報錯; -o pipefail: 管線中任一指令失敗則整條管線失敗
 set -euo pipefail
 
 # 取得腳本所在的絕對路徑（無論從哪裡執行都能正確定位）
-SCRIPTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# 最終輸出根目錄
-OUTPUT_DIR="$SCRIPTDIR/slack_data"
+readonly SCRIPTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Skill 根目錄（腳本位於 scripts/ 子目錄內，上一層即為 skill root）
+readonly SKILL_DIR="$(cd "$SCRIPTDIR/.." && pwd)"
+# 專案根目錄（透過 git 定位，fallback 為相對路徑推算）
+readonly PROJECT_ROOT="$(cd "$SCRIPTDIR" && git rev-parse --show-toplevel 2>/dev/null || (cd "$SCRIPTDIR/../../../.." && pwd))"
+# 最終輸出根目錄（放在專案根目錄下的 slack_data/）
+readonly OUTPUT_DIR="$PROJECT_ROOT/slack_data"
 # map 型快取資料目錄（使用者/群組/頻道對照表）
-CACHE_DIR="$OUTPUT_DIR/cache_data"
+readonly CACHE_DIR="$OUTPUT_DIR/cache_data"
 
 # ── Helper functions ──
 
@@ -52,9 +56,11 @@ validate_date() {
 }
 
 # 驗證設定檔中的必要欄位：slack_token、channels
+# 注意：SLACK_TOKEN 在此函數之後於腳本層級設定（見 main 段落）
 validate_config() {
-  SLACK_TOKEN=$(jq -r '.slack_token // empty' "$CONFIG_FILE")
-  if [[ -z "$SLACK_TOKEN" ]]; then
+  local token
+  token=$(jq -r '.slack_token // empty' "$CONFIG_FILE")
+  if [[ -z "$token" ]]; then
     echo "Error: slack_token missing in $CONFIG_FILE" >&2
     exit 1
   fi
@@ -134,11 +140,10 @@ stage1_fetch() {
   # 建立快取目錄
   mkdir -p "$CACHE_DIR"
 
-  # Temp dir for intermediate pagination merges
-  # 建立暫存目錄，並設定 trap 在腳本結束時自動清理
+  # 建立暫存目錄（用於分頁合併的中間檔案），註冊到統一清理陣列
   local tmpdir
   tmpdir=$(mktemp -d)
-  trap "rm -rf '$tmpdir'" EXIT
+  _cleanup_dirs+=("$tmpdir")
 
   # 建立使用者對照表：呼叫 users.list API，cursor-based pagination 翻頁，每次最多 200 筆。最終用 jq reduce 轉為 { UXXXXX: 顯示名稱 } 格式。名稱優先順序：display_name > real_name > name > unknown
   # ── User map ──
@@ -233,7 +238,7 @@ stage1_fetch() {
     local messages_file="$tmpdir/messages.json"
     echo '[]' > "$messages_file"
 
-    # Fetch history
+    # 拉取頻道歷史訊息
     cursor=""
     local channel_failed=false
     while :; do
@@ -304,10 +309,12 @@ stage2_convert() {
   require_file "$CACHE_DIR/usergroup_map.json"
   require_file "$CACHE_DIR/channel_id_to_name.json"
 
+  # 建立暫存目錄（用於 Markdown 轉換的中間檔案與 sed 腳本），註冊到統一清理陣列
   local tmpdir
   tmpdir=$(mktemp -d)
-  trap "rm -rf '$tmpdir'" EXIT
+  _cleanup_dirs+=("$tmpdir")
 
+  # 讀取設定檔中的頻道列表
   local channel_names=()
   while IFS= read -r line; do
     channel_names+=("$line")
@@ -477,16 +484,27 @@ if [[ $# -lt 2 ]]; then
   exit 1
 fi
 
-START_DATE="$1"
-END_DATE="$2"
+readonly START_DATE="$1"
+readonly END_DATE="$2"
 
 validate_date "start_date" "$START_DATE"
 validate_date "end_date" "$END_DATE"
 
-CONFIG_FILE="$SCRIPTDIR/config.json"
+readonly CONFIG_FILE="$SKILL_DIR/config.json"
 require_file "$CONFIG_FILE"
 
 validate_config
+# 驗證通過後，在腳本層級設定 SLACK_TOKEN（供 slack_api 函數使用）
+readonly SLACK_TOKEN=$(jq -r '.slack_token // empty' "$CONFIG_FILE")
+
+# 統一清理機制：各階段透過 _cleanup_dirs+=(...) 註冊暫存目錄，腳本結束時一次清除
+_cleanup_dirs=()
+_cleanup() {
+  for d in "${_cleanup_dirs[@]}"; do
+    rm -rf "$d"
+  done
+}
+trap _cleanup EXIT
 
 stage1_fetch
 stage2_convert
