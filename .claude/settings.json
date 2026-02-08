@@ -1,0 +1,11 @@
+{
+  "enabledPlugins": {
+    "example-skills@anthropic-agent-skills": true
+  },
+  "permissions": {
+    "allow": [
+      "Bash(bash .claude/skills/*)",
+      "Bash(.claude/skills/*)"
+    ]
+  }
+}
