@@ -35,6 +35,12 @@ Check for dependency files and install accordingly:
 - If neither exists but the script has third-party imports → create a `requirements.txt` first, then install via `uv pip install -r requirements.txt`
 - If no external dependencies are needed, skip this step.
 
+After installing dependencies, always ensure `ruff` is available as a dev dependency:
+
+```bash
+uv add --dev ruff
+```
+
 ### Step 4: Verify config.json
 
 Check if `config.json` exists in the expected location (project root unless specified otherwise).
@@ -49,6 +55,20 @@ ALWAYS run Python scripts using:
 ```bash
 uv run python <script_path>
 ```
+
+## Code Formatting
+
+After writing or modifying any Python script, ALWAYS run `ruff` to format the code:
+
+```bash
+uv run ruff format <script_path>
+uv run ruff check --fix <script_path>
+```
+
+- `ruff format` — 自動格式化程式碼風格
+- `ruff check --fix` — 自動修正可修正的 lint 問題
+
+This step is mandatory and must not be skipped.
 
 ## Strict Prohibitions
 
